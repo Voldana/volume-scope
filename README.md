@@ -1,4 +1,5 @@
 # VolumeScope
+![CI](https://github.com/Voldana/volume-scope/actions/workflows/ci.yml/badge.svg)
 
 A desktop viewer for large 3D scan data (CT, MRI, ultrasound, simulations), written in modern C++20 and CUDA.
 It loads a scalar volume, processes it on the GPU, and renders it interactively with CUDA ray marching.
