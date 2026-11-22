@@ -1,0 +1,11 @@
+build/
+out/
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+compile_commands.json
+
+# Datasets are large: download them, don't commit them.
+data/*
+!data/README.md
