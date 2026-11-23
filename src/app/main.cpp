@@ -39,6 +39,7 @@ struct Settings {
     float renderScale = 1.0f;
     float sigma = 1.5f;
     int preset = 1;
+    int filter = 0; ///< 0 Gaussian, 1 median, 2 Sobel.
 };
 
 /// OpenGL texture that shows the CUDA render. Uses only GL 1.1 entry points,
@@ -306,21 +307,46 @@ int run(int argc, char** argv) {
             transferTexture = vs::gpu::TransferTexture(vs::TransferFunction::preset(settings.preset));
         }
 
-        ImGui::SeparatorText("Gaussian filter");
-        ImGui::SliderFloat("Sigma", &settings.sigma, 0.5f, 5.0f);
+        ImGui::SeparatorText("Image processing");
+        constexpr const char* kFilterNames[] = {"Gaussian blur", "Median 3x3x3", "Sobel edges"};
+        ImGui::Combo("Filter", &settings.filter, kFilterNames, 3);
+        if (settings.filter == 0) {
+            ImGui::SliderFloat("Sigma", &settings.sigma, 0.5f, 5.0f);
+        }
+        const std::string filterName = kFilterNames[settings.filter];
         if (ImGui::Button("Apply on GPU")) {
             float gpuMs = 0.0f;
-            current = vs::gpu::gaussianBlurGpu(current, settings.sigma, &gpuMs);
+            switch (settings.filter) {
+            case 0:
+                current = vs::gpu::gaussianBlurGpu(current, settings.sigma, &gpuMs);
+                break;
+            case 1:
+                current = vs::gpu::median3Gpu(current, &gpuMs);
+                break;
+            default:
+                current = vs::gpu::sobelMagnitudeGpu(current, &gpuMs);
+                break;
+            }
             volumeTexture = vs::gpu::VolumeTexture(current);
-            status = "GPU Gaussian: " + std::to_string(gpuMs) + " ms (kernels only)";
+            status = "GPU " + filterName + ": " + std::to_string(gpuMs) + " ms (kernels only)";
         }
         ImGui::SameLine();
         if (ImGui::Button("Apply on CPU")) {
             const auto start = std::chrono::steady_clock::now();
-            current = vs::gaussianBlurCpu(current, settings.sigma);
+            switch (settings.filter) {
+            case 0:
+                current = vs::gaussianBlurCpu(current, settings.sigma, vs::CpuMode::Parallel);
+                break;
+            case 1:
+                current = vs::median3Cpu(current, vs::CpuMode::Parallel);
+                break;
+            default:
+                current = vs::sobelMagnitudeCpu(current, vs::CpuMode::Parallel);
+                break;
+            }
             const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - start;
             volumeTexture = vs::gpu::VolumeTexture(current);
-            status = "CPU Gaussian: " + std::to_string(elapsed.count()) + " ms (single thread)";
+            status = "CPU " + filterName + ": " + std::to_string(elapsed.count()) + " ms (all threads)";
         }
         ImGui::SameLine();
         if (ImGui::Button("Reset")) {
