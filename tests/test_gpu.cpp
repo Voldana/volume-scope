@@ -22,7 +22,18 @@ bool hasCudaDevice() {
     return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
 
-#define REQUIRE_CUDA()                                                                                                 \
+float maxAbsDiff(const vs::Volume& a, const vs::Volume& b) {
+    EXPECT_EQ(a.dims(), b.dims());
+    float result = 0.0f;
+    const auto va = a.voxels();
+    const auto vb = b.voxels();
+    for (std::size_t i = 0; i < std::min(va.size(), vb.size()); ++i) {
+        result = std::max(result, std::fabs(va[i] - vb[i]));
+    }
+    return result;
+}
+
+#define REQUIRE_CUDA()                                                                                               \
     if (!hasCudaDevice()) GTEST_SKIP() << "No CUDA device available"
 
 } // namespace
@@ -59,16 +70,37 @@ TEST(GpuGaussian, MatchesCpuReference) {
     REQUIRE_CUDA();
     const vs::Volume volume = vs::makeTestVolume({48, 40, 32});
     const vs::Volume cpu = vs::gaussianBlurCpu(volume, 1.5f);
-    const vs::Volume gpu = vs::gpu::gaussianBlurGpu(volume, 1.5f);
-    ASSERT_EQ(cpu.dims(), gpu.dims());
+    const vs::Volume gpu = vs::gpu::gaussianBlurGpu(volume, 1.5f, nullptr, vs::gpu::ConvolutionKernel::Naive);
+    EXPECT_LT(maxAbsDiff(cpu, gpu), 1e-5f);
+}
 
-    float maxError = 0.0f;
-    const auto a = cpu.voxels();
-    const auto b = gpu.voxels();
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        maxError = std::max(maxError, std::fabs(a[i] - b[i]));
+TEST(GpuGaussian, TiledMatchesCpuReferenceOnAwkwardSizes) {
+    REQUIRE_CUDA();
+    // Sizes that are not multiples of the tile sizes, axes shorter than the kernel radius,
+    // and the largest supported radius (sigma 5 -> radius 15).
+    const vs::Dims sizes[] = {{45, 37, 29}, {5, 70, 3}, {130, 2, 33}};
+    for (const vs::Dims dims : sizes) {
+        for (const float sigma : {0.8f, 1.5f, 5.0f}) {
+            const vs::Volume volume = vs::makeTestVolume(dims);
+            const vs::Volume cpu = vs::gaussianBlurCpu(volume, sigma);
+            const vs::Volume gpu =
+                vs::gpu::gaussianBlurGpu(volume, sigma, nullptr, vs::gpu::ConvolutionKernel::Tiled);
+            EXPECT_LT(maxAbsDiff(cpu, gpu), 1e-5f)
+                << dims.x << "x" << dims.y << "x" << dims.z << ", sigma " << sigma;
+        }
     }
-    EXPECT_LT(maxError, 1e-5f);
+}
+
+TEST(GpuMedian, MatchesCpuExactly) {
+    REQUIRE_CUDA();
+    const vs::Volume volume = vs::makeTestVolume({33, 21, 17});
+    EXPECT_EQ(maxAbsDiff(vs::median3Cpu(volume), vs::gpu::median3Gpu(volume)), 0.0f);
+}
+
+TEST(GpuSobel, MatchesCpuReference) {
+    REQUIRE_CUDA();
+    const vs::Volume volume = vs::makeTestVolume({33, 21, 17});
+    EXPECT_LT(maxAbsDiff(vs::sobelMagnitudeCpu(volume), vs::gpu::sobelMagnitudeGpu(volume)), 1e-5f);
 }
 
 TEST(GpuGaussian, RejectsMismatchedBuffers) {
