@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <numeric>
 #include <stdexcept>
 
@@ -45,6 +46,68 @@ TEST(GaussianBlurCpu, PreservesMassOfInteriorImpulse) {
     EXPECT_LT(blurred.at(8, 8, 8), 1.0f);
     EXPECT_FLOAT_EQ(blurred.at(7, 8, 8), blurred.at(9, 8, 8));
     EXPECT_FLOAT_EQ(blurred.at(8, 7, 8), blurred.at(8, 8, 9));
+}
+
+TEST(CpuFilters, ParallelMatchesSerialExactly) {
+    const vs::Volume volume = vs::makeTestVolume({31, 23, 19});
+    const auto equal = [](const vs::Volume& a, const vs::Volume& b) {
+        return std::equal(a.voxels().begin(), a.voxels().end(), b.voxels().begin());
+    };
+    EXPECT_TRUE(equal(vs::gaussianBlurCpu(volume, 1.5f, vs::CpuMode::Serial),
+                      vs::gaussianBlurCpu(volume, 1.5f, vs::CpuMode::Parallel)));
+    EXPECT_TRUE(equal(vs::median3Cpu(volume, vs::CpuMode::Serial), vs::median3Cpu(volume, vs::CpuMode::Parallel)));
+    EXPECT_TRUE(equal(vs::sobelMagnitudeCpu(volume, vs::CpuMode::Serial),
+                      vs::sobelMagnitudeCpu(volume, vs::CpuMode::Parallel)));
+}
+
+TEST(Median3Cpu, RemovesIsolatedImpulse) {
+    vs::Volume volume(vs::Dims{7, 7, 7});
+    volume.at(3, 3, 3) = 1.0f;
+    const vs::Volume filtered = vs::median3Cpu(volume);
+    for (const float v : filtered.voxels()) {
+        EXPECT_FLOAT_EQ(v, 0.0f);
+    }
+}
+
+TEST(Median3Cpu, KeepsStepEdge) {
+    vs::Volume volume(vs::Dims{8, 4, 4});
+    for (int z = 0; z < 4; ++z) {
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 4; x < 8; ++x) {
+                volume.at(x, y, z) = 1.0f;
+            }
+        }
+    }
+    const vs::Volume filtered = vs::median3Cpu(volume);
+    EXPECT_FLOAT_EQ(filtered.at(3, 2, 2), 0.0f);
+    EXPECT_FLOAT_EQ(filtered.at(4, 2, 2), 1.0f);
+}
+
+TEST(SobelCpu, IsZeroOnConstantVolume) {
+    vs::Volume volume(vs::Dims{6, 6, 6});
+    for (float& v : volume.voxels()) {
+        v = 0.7f;
+    }
+    // Keep the result alive: ranging over a temporary's span would dangle (C++20 range-for lifetime rule).
+    const vs::Volume gradient = vs::sobelMagnitudeCpu(volume);
+    for (const float v : gradient.voxels()) {
+        EXPECT_FLOAT_EQ(v, 0.0f);
+    }
+}
+
+TEST(SobelCpu, GivesHalfOnUnitStepEdge) {
+    vs::Volume volume(vs::Dims{8, 5, 5});
+    for (int z = 0; z < 5; ++z) {
+        for (int y = 0; y < 5; ++y) {
+            for (int x = 4; x < 8; ++x) {
+                volume.at(x, y, z) = 1.0f;
+            }
+        }
+    }
+    const vs::Volume gradient = vs::sobelMagnitudeCpu(volume);
+    EXPECT_FLOAT_EQ(gradient.at(3, 2, 2), 0.5f);
+    EXPECT_FLOAT_EQ(gradient.at(4, 2, 2), 0.5f);
+    EXPECT_FLOAT_EQ(gradient.at(1, 2, 2), 0.0f);
 }
 
 TEST(ProceduralVolume, StaysInUnitRange) {

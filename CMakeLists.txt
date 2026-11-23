@@ -42,7 +42,8 @@ add_library(volumescope_core STATIC
     src/core/TransferFunction.cpp
     src/core/CpuFilters.cpp)
 target_include_directories(volumescope_core PUBLIC src)
-target_link_libraries(volumescope_core PRIVATE volumescope_warnings)
+find_package(Threads REQUIRED)
+target_link_libraries(volumescope_core PUBLIC Threads::Threads PRIVATE volumescope_warnings)
 
 # ---------------------------------------------------------------------------
 # GPU: CUDA resources, kernels and the ray marcher.
@@ -55,6 +56,10 @@ add_library(volumescope_gpu STATIC
 target_link_libraries(volumescope_gpu
     PUBLIC volumescope_core CUDA::cudart
     PRIVATE volumescope_warnings)
+
+# CPU vs GPU filter benchmarks (prints a Markdown table).
+add_executable(volumescope_bench src/bench/main.cpp)
+target_link_libraries(volumescope_bench PRIVATE volumescope_gpu volumescope_warnings)
 
 # ---------------------------------------------------------------------------
 # Desktop viewer: GLFW + Dear ImGui (OpenGL 3.3).
