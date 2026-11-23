@@ -4,7 +4,7 @@
 A desktop viewer for large 3D scan data (CT, MRI, ultrasound, simulations), written in modern C++20 and CUDA.
 It loads a scalar volume, processes it on the GPU, and renders it interactively with CUDA ray marching.
 
-> Status: stage 1 scaffold. See the roadmap below.
+> Status: stages 1 and 2 in progress. See the roadmap below.
 
 ![VolumeScope rendering the procedural test volume with the Bone transfer function](docs/images/viewer-bone.png)
 
@@ -26,7 +26,10 @@ volumescope --preset 1 --blur 3 --screenshot docs/images/viewer-gpu-blur.png
 - **CUDA volume ray marching**: front-to-back compositing, opacity correction, early ray termination,
   hardware trilinear sampling through a 3D texture object.
 - **Transfer functions**: control points baked into a 1D lookup texture (Grayscale, Bone, Heat presets).
-- **GPU image processing**: separable 3D Gaussian blur in CUDA, validated against a CPU reference.
+- **GPU image processing**: separable 3D Gaussian blur (naive and shared-memory tiled kernels), 3×3×3 median
+  filter and 3D Sobel gradient magnitude in CUDA, each validated against a CPU reference.
+- **Benchmarks**: `volumescope_bench` times every filter on 1 CPU thread, all CPU threads and the GPU, and checks
+  the GPU output against the CPU reference.
 - **Raw volume loader**: Open SciVis naming convention, `uint8` / `uint16` / `float32`, normalized to [0, 1].
 - **Desktop UI**: GLFW + Dear ImGui, orbit camera, live render settings and timings, PNG screenshots.
 - **Tests and CI**: GoogleTest for CPU code and GPU code (GPU tests skip when no device), GitHub Actions on Linux.
@@ -66,6 +69,7 @@ src/
   core/   CPU only: Volume, raw loader, transfer functions, reference filters, procedural data
   gpu/    CUDA: RAII device buffers and textures, ray marcher, filters
   app/    GLFW + ImGui viewer
+  bench/  CPU vs GPU filter benchmarks
 tests/    GoogleTest (CPU tests + GPU tests labelled "gpu")
 ```
 
@@ -78,13 +82,31 @@ Design choices:
 
 ## Benchmarks
 
-| Operation | Volume | CPU | GPU | Speed-up |
-|---|---|---|---|---|
-| Gaussian blur, sigma 1.5 | 256³ | _todo_ | _todo_ | _todo_ |
-| Ray march, 1600×900 | 256³ | n/a | _todo_ | n/a |
+256³ float volume (64 MB), NVIDIA GeForce RTX 5070 Ti, 20-thread CPU, Release build.
+GPU times are the median of 10 runs and cover the kernels only; CPU times are one run each.
 
-Measure on your own machine and fill these in. Note the GPU model, and compare against a multithreaded
-CPU baseline before quoting a speed-up.
+| Filter | CPU 1 thread (ms) | CPU 20 threads (ms) | GPU (ms) | vs 20 threads | Max error vs CPU |
+|---|---|---|---|---|---|
+| Gaussian, σ 1.5 (naive kernel) | 2180.5 | 182.1 | 0.771 | 236× | 2.4e-7 |
+| Gaussian, σ 1.5 (shared-memory tiled kernel) | 2180.5 | 182.1 | **0.516** | 353× | 2.4e-7 |
+| Median 3×3×3 | 2017.6 | 133.7 | 3.665 | 36× | 0 (exact) |
+| Sobel gradient magnitude | 2674.6 | 184.3 | 3.290 | 56× | 3.0e-8 |
+
+Reading the numbers honestly:
+
+- **Tiling makes the Gaussian 1.5× faster.** The three tiled passes move about 384 MB (read and write, 64 MB each,
+  three times) in 0.52 ms, roughly 740 GB/s, which is close to the card's ~900 GB/s memory bandwidth. The kernel is
+  bandwidth-bound, so further gains need fewer passes or less data (for example `half` storage), not more maths.
+- **The CPU baselines are straightforward reference code**, not SIMD-optimized, so the speed-ups against them are
+  generous. They are useful as correctness references and as a fair "same algorithm" comparison.
+- **Transfers dominate a single filter call:** the tiled Gaussian takes 37 ms end to end including allocation and
+  copying 64 MB each way over PCIe. Keeping data on the GPU between steps matters more than kernel speed.
+
+Reproduce with:
+
+```
+build\windows-vs\Release\volumescope_bench.exe --size 256 --sigma 1.5 --runs 10
+```
 
 ## Roadmap
 
@@ -95,9 +117,11 @@ CPU baseline before quoting a speed-up.
 - [ ] Editable transfer function in the UI
 
 **Stage 2: image processing**
-- [ ] Shared-memory tiled convolution and a benchmark against the naive kernel
-- [ ] Median filter, threshold and segmentation, Sobel edge detection
-- [ ] Multithreaded CPU baselines and a benchmark tool (`volumescope_bench`)
+- [x] Shared-memory tiled convolution and a benchmark against the naive kernel
+- [x] Median filter and Sobel edge detection
+- [ ] Threshold and connected-component segmentation
+- [x] Multithreaded CPU baselines and a benchmark tool (`volumescope_bench`)
+- [ ] Keep data on the GPU between filters (filter chains without host round trips)
 
 **Stage 3: large data**
 - [ ] Memory-mapped loading

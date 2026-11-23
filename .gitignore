@@ -9,3 +9,6 @@ compile_commands.json
 # Datasets are large: download them, don't commit them.
 data/*
 !data/README.md
+
+# Dear ImGui window layout
+imgui.ini
