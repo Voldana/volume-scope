@@ -13,6 +13,8 @@ option(VOLUMESCOPE_BUILD_TESTS "Build the unit tests" ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# No C++20 modules here; scanning for them slows builds and confuses Visual Studio IntelliSense.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -40,7 +42,11 @@ add_library(volumescope_core STATIC
     src/core/RawLoader.cpp
     src/core/Procedural.cpp
     src/core/TransferFunction.cpp
-    src/core/CpuFilters.cpp)
+    src/core/CpuFilters.cpp
+    src/core/MappedFile.cpp
+    src/core/VolumeSource.cpp
+    src/core/Bricking.cpp
+    src/core/BrickCache.cpp)
 target_include_directories(volumescope_core PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(volumescope_core PUBLIC Threads::Threads PRIVATE volumescope_warnings)
@@ -52,7 +58,9 @@ add_library(volumescope_gpu STATIC
     src/gpu/VolumeTexture.cpp
     src/gpu/TransferTexture.cpp
     src/gpu/Raymarcher.cu
-    src/gpu/Filters.cu)
+    src/gpu/Filters.cu
+    src/gpu/BrickAtlas.cu
+    src/gpu/StreamingRenderer.cu)
 target_link_libraries(volumescope_gpu
     PUBLIC volumescope_core CUDA::cudart
     PRIVATE volumescope_warnings)
@@ -60,6 +68,13 @@ target_link_libraries(volumescope_gpu
 # CPU vs GPU filter benchmarks (prints a Markdown table).
 add_executable(volumescope_bench src/bench/main.cpp)
 target_link_libraries(volumescope_bench PRIVATE volumescope_gpu volumescope_warnings)
+set_target_properties(volumescope_bench PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    VS_DEBUGGER_COMMAND_ARGUMENTS "--size 256 --sigma 1.5 --runs 10")
+
+# Writes a large procedural .raw file, for trying out-of-core streaming without a download.
+add_executable(volumescope_gen src/tools/generate.cpp)
+target_link_libraries(volumescope_gen PRIVATE volumescope_core volumescope_warnings)
 
 # ---------------------------------------------------------------------------
 # Desktop viewer: GLFW + Dear ImGui (OpenGL 3.3).
@@ -100,6 +115,8 @@ if(VOLUMESCOPE_BUILD_APP)
 
     add_executable(volumescope src/app/main.cpp)
     target_link_libraries(volumescope PRIVATE volumescope_gpu imgui stb volumescope_warnings)
+    # F5 in Visual Studio runs from the repo root, so data/ and docs/ paths work.
+    set_target_properties(volumescope PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT volumescope)
 endif()
 
@@ -121,11 +138,12 @@ if(VOLUMESCOPE_BUILD_TESTS)
     add_executable(volumescope_tests
         tests/test_raw_loader.cpp
         tests/test_cpu_filters.cpp
-        tests/test_transfer_function.cpp)
+        tests/test_transfer_function.cpp
+        tests/test_bricking.cpp)
     target_link_libraries(volumescope_tests PRIVATE volumescope_core GTest::gtest_main volumescope_warnings)
     gtest_discover_tests(volumescope_tests DISCOVERY_MODE PRE_TEST)
 
-    add_executable(volumescope_gpu_tests tests/test_gpu.cpp)
+    add_executable(volumescope_gpu_tests tests/test_gpu.cpp tests/test_streaming.cpp)
     target_link_libraries(volumescope_gpu_tests PRIVATE volumescope_gpu GTest::gtest_main volumescope_warnings)
     gtest_discover_tests(volumescope_gpu_tests DISCOVERY_MODE PRE_TEST PROPERTIES LABELS gpu)
 endif()
