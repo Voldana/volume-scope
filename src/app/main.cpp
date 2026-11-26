@@ -3,8 +3,10 @@
 #include "core/Procedural.h"
 #include "core/RawLoader.h"
 #include "core/TransferFunction.h"
+#include "core/VolumeSource.h"
 #include "gpu/Filters.h"
 #include "gpu/Raymarcher.h"
+#include "gpu/StreamingRenderer.h"
 #include "gpu/TransferTexture.h"
 #include "gpu/VolumeTexture.h"
 
@@ -22,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,25 +78,13 @@ private:
     int height_ = 0;
 };
 
-vs::gpu::RenderParams makeRenderParams(const vs::OrbitCamera& camera, const vs::Volume& volume, int width,
+vs::gpu::RenderParams makeRenderParams(const vs::OrbitCamera& camera, vs::Dims dims, vs::Spacing spacing, int width,
                                        int height, const Settings& settings) {
     vs::gpu::RenderParams params;
     params.eye = camera.eye();
     camera.basis(params.forward, params.right, params.up);
     params.aspect = static_cast<float>(width) / static_cast<float>(height);
-
-    // Fit the volume's physical extent into a box whose longest side is 1.
-    const vs::Dims d = volume.dims();
-    const vs::Spacing s = volume.spacing();
-    const vs::Vec3 extent{static_cast<float>(d.x) * s.x, static_cast<float>(d.y) * s.y,
-                          static_cast<float>(d.z) * s.z};
-    const float longest = std::max({extent.x, extent.y, extent.z});
-    params.boxMax = extent * (0.5f / longest);
-    params.boxMin = -params.boxMax;
-
-    const int longestDim = std::max({d.x, d.y, d.z});
-    params.stepSize = 1.0f / (static_cast<float>(longestDim) * settings.samplesPerVoxel);
-    params.maxSteps = static_cast<int>(static_cast<float>(longestDim) * settings.samplesPerVoxel * 2.0f) + 16;
+    vs::gpu::fitVolume(params, dims, spacing, settings.samplesPerVoxel);
     params.densityScale = settings.densityScale;
     params.brightness = settings.brightness;
     return params;
@@ -106,11 +97,17 @@ struct Options {
     int preset = 1;
     float blurSigma = 0.0f; ///< > 0: apply the GPU Gaussian at startup.
     float density = 50.0f;
+    bool stream = false; ///< Out-of-core: stream bricks into a GPU cache instead of loading the volume.
+    std::size_t cacheMb = 256;
 };
 
 constexpr const char* kUsage =
     "Usage: volumescope [volume_WxHxD_type.raw] [--preset N] [--density D] [--blur SIGMA]\n"
-    "                   [--screenshot out.png]\n";
+    "                   [--stream] [--cache-mb MB] [--screenshot out.png]\n"
+    "  --stream     out-of-core rendering: bricks stream into a GPU cache of --cache-mb (default 256)\n";
+
+/// Upper bound on frames rendered before a --screenshot is taken while bricks stream in.
+constexpr int kMaxScreenshotFrames = 600;
 
 Options parseOptions(int argc, char** argv) {
     Options options;
@@ -130,6 +127,10 @@ Options parseOptions(int argc, char** argv) {
             options.density = std::stof(next());
         } else if (arg == "--blur") {
             options.blurSigma = std::stof(next());
+        } else if (arg == "--stream") {
+            options.stream = true;
+        } else if (arg == "--cache-mb") {
+            options.cacheMb = static_cast<std::size_t>(std::stoul(next()));
         } else if (arg == "--help" || arg == "-h") {
             std::printf("%s", kUsage);
             std::exit(0);
@@ -143,6 +144,12 @@ Options parseOptions(int argc, char** argv) {
     if (options.preset < 0 || options.preset >= presetCount) {
         throw std::invalid_argument("--preset must be between 0 and " + std::to_string(presetCount - 1));
     }
+    if (options.stream && options.blurSigma > 0.0f) {
+        throw std::invalid_argument("--blur needs the volume in memory and cannot be combined with --stream");
+    }
+    if (options.stream && options.cacheMb == 0) {
+        throw std::invalid_argument("--cache-mb must be positive");
+    }
     return options;
 }
 
@@ -153,6 +160,16 @@ vs::Volume loadInitialVolume(const Options& options) {
     }
     std::printf("No file given, using the procedural test volume.\n%s", kUsage);
     return vs::makeTestVolume();
+}
+
+/// Opens the volume for streaming: memory-mapped file, or the procedural volume held in memory.
+std::shared_ptr<const vs::VolumeSource> openStreamSource(const Options& options) {
+    if (!options.volumePath.empty()) {
+        std::printf("Streaming %s (memory-mapped)\n", options.volumePath.c_str());
+        return std::make_shared<vs::RawFileSource>(options.volumePath);
+    }
+    std::printf("No file given, streaming the procedural test volume.\n%s", kUsage);
+    return std::make_shared<vs::MemoryVolumeSource>(vs::makeTestVolume());
 }
 
 /// Reads the back buffer (UI included) and writes it as an opaque PNG.
@@ -219,7 +236,15 @@ struct ImGuiSession {
 
 int run(int argc, char** argv) {
     const Options options = parseOptions(argc, argv);
-    const vs::Volume original = loadInitialVolume(options);
+
+    // Either an in-memory volume (filters available) or a streamed source (out-of-core).
+    std::shared_ptr<const vs::VolumeSource> streamSource;
+    vs::Volume original;
+    if (options.stream) {
+        streamSource = openStreamSource(options);
+    } else {
+        original = loadInitialVolume(options);
+    }
     vs::Volume current = original;
 
     GlfwSession glfw;
@@ -247,11 +272,28 @@ int run(int argc, char** argv) {
 
     vs::OrbitCamera camera;
     vs::gpu::Raymarcher raymarcher;
-    vs::gpu::VolumeTexture volumeTexture(current);
     vs::gpu::TransferTexture transferTexture(vs::TransferFunction::preset(settings.preset));
+    vs::gpu::VolumeTexture volumeTexture;
+    std::unique_ptr<vs::gpu::StreamingRenderer> streamer;
+    if (streamSource) {
+        vs::gpu::StreamingConfig config;
+        config.cacheBytes = options.cacheMb << 20;
+        streamer = std::make_unique<vs::gpu::StreamingRenderer>(streamSource,
+                                                                vs::TransferFunction::preset(settings.preset), config);
+        const auto& s = streamer->stats();
+        std::printf("%d bricks (%d empty under this transfer function), %d cache slots, index built in %.0f ms\n",
+                    s.bricksTotal, s.bricksEmpty, s.slotCount, static_cast<double>(s.indexBuildMs));
+    } else {
+        volumeTexture = vs::gpu::VolumeTexture(current);
+    }
+    const vs::Dims dims = streamSource ? streamSource->dims() : current.dims();
+    const vs::Spacing spacing = streamSource ? streamSource->spacing() : current.spacing();
+
     DisplayTexture display;
     std::vector<std::uint32_t> pixels;
     float renderMs = 0.0f;
+    int renderWidth = 0;
+    int renderHeight = 0;
     int frame = 0;
 
     while (glfwWindowShouldClose(window) == GLFW_FALSE) {
@@ -274,28 +316,39 @@ int run(int argc, char** argv) {
         int framebufferHeight = 0;
         glfwGetFramebufferSize(window, &framebufferWidth, &framebufferHeight);
         if (framebufferWidth > 0 && framebufferHeight > 0) {
-            const int width = std::max(1, static_cast<int>(static_cast<float>(framebufferWidth) * settings.renderScale));
-            const int height =
-                std::max(1, static_cast<int>(static_cast<float>(framebufferHeight) * settings.renderScale));
-            raymarcher.resize(width, height);
-            pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-            renderMs = raymarcher.render(volumeTexture.handle(), transferTexture.handle(),
-                                         makeRenderParams(camera, current, width, height, settings), pixels);
-            display.upload(width, height, pixels);
+            renderWidth = std::max(1, static_cast<int>(static_cast<float>(framebufferWidth) * settings.renderScale));
+            renderHeight = std::max(1, static_cast<int>(static_cast<float>(framebufferHeight) * settings.renderScale));
+            pixels.resize(static_cast<std::size_t>(renderWidth) * static_cast<std::size_t>(renderHeight));
+            const vs::gpu::RenderParams params =
+                makeRenderParams(camera, dims, spacing, renderWidth, renderHeight, settings);
+            if (streamer) {
+                streamer->resize(renderWidth, renderHeight);
+                renderMs = streamer->render(transferTexture.handle(), params, pixels);
+            } else {
+                raymarcher.resize(renderWidth, renderHeight);
+                renderMs = raymarcher.render(volumeTexture.handle(), transferTexture.handle(), params, pixels);
+            }
+            display.upload(renderWidth, renderHeight, pixels);
             ImGui::GetBackgroundDrawList()->AddImage(static_cast<ImTextureID>(display.id()), ImVec2(0.0f, 0.0f),
                                                      io.DisplaySize);
         }
 
         ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360.0f, 0.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(470.0f, 0.0f), ImGuiCond_FirstUseEver);
         ImGui::Begin("VolumeScope");
 
-        const vs::Dims dims = current.dims();
-        ImGui::Text("%s", current.name().c_str());
-        ImGui::Text("%d x %d x %d  (%.1f MB as float)", dims.x, dims.y, dims.z,
-                    static_cast<double>(current.sizeBytes()) / (1024.0 * 1024.0));
-        ImGui::Text("Ray march: %.2f ms at %d x %d  |  %.0f FPS", static_cast<double>(renderMs), raymarcher.width(),
-                    raymarcher.height(), static_cast<double>(io.Framerate));
+        constexpr double kMb = 1024.0 * 1024.0;
+        if (streamSource) {
+            ImGui::Text("%s", streamSource->name().c_str());
+            ImGui::Text("%d x %d x %d  (%.0f MB source, streamed)", dims.x, dims.y, dims.z,
+                        static_cast<double>(streamSource->storedBytes()) / kMb);
+        } else {
+            ImGui::Text("%s", current.name().c_str());
+            ImGui::Text("%d x %d x %d  (%.1f MB as float)", dims.x, dims.y, dims.z,
+                        static_cast<double>(current.sizeBytes()) / kMb);
+        }
+        ImGui::Text("Ray march: %.2f ms at %d x %d  |  %.0f FPS", static_cast<double>(renderMs), renderWidth,
+                    renderHeight, static_cast<double>(io.Framerate));
 
         ImGui::SeparatorText("Rendering");
         ImGui::SliderFloat("Density", &settings.densityScale, 1.0f, 400.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
@@ -304,57 +357,79 @@ int run(int argc, char** argv) {
         ImGui::SliderFloat("Render scale", &settings.renderScale, 0.25f, 1.0f);
         const auto presets = vs::TransferFunction::presetNames();
         if (ImGui::Combo("Transfer function", &settings.preset, presets.data(), static_cast<int>(presets.size()))) {
-            transferTexture = vs::gpu::TransferTexture(vs::TransferFunction::preset(settings.preset));
+            const vs::TransferFunction transfer = vs::TransferFunction::preset(settings.preset);
+            transferTexture = vs::gpu::TransferTexture(transfer);
+            if (streamer) {
+                streamer->setTransferFunction(transfer); // Changes which bricks are empty.
+            }
         }
 
-        ImGui::SeparatorText("Image processing");
-        constexpr const char* kFilterNames[] = {"Gaussian blur", "Median 3x3x3", "Sobel edges"};
-        ImGui::Combo("Filter", &settings.filter, kFilterNames, 3);
-        if (settings.filter == 0) {
-            ImGui::SliderFloat("Sigma", &settings.sigma, 0.5f, 5.0f);
-        }
-        const std::string filterName = kFilterNames[settings.filter];
-        if (ImGui::Button("Apply on GPU")) {
-            float gpuMs = 0.0f;
-            switch (settings.filter) {
-            case 0:
-                current = vs::gpu::gaussianBlurGpu(current, settings.sigma, &gpuMs);
-                break;
-            case 1:
-                current = vs::gpu::median3Gpu(current, &gpuMs);
-                break;
-            default:
-                current = vs::gpu::sobelMagnitudeGpu(current, &gpuMs);
-                break;
+        if (streamer) {
+            const vs::gpu::StreamingStats& s = streamer->stats();
+            ImGui::SeparatorText("Out-of-core streaming");
+            ImGui::Text("Cache: %d / %d bricks resident (%.0f MB on GPU)", s.bricksResident, s.slotCount,
+                        static_cast<double>(s.cacheBytes) / kMb);
+            ImGui::Text("Empty bricks skipped: %d of %d", s.bricksEmpty, s.bricksTotal);
+            if (streamer->converged()) {
+                ImGui::TextUnformatted("Full resolution: every visible brick is resident");
+            } else {
+                ImGui::Text("Visible bricks still streaming: %d%s", s.bricksMissing,
+                            s.saturated ? "  (cache full, rest uses preview)" : "");
             }
-            volumeTexture = vs::gpu::VolumeTexture(current);
-            status = "GPU " + filterName + ": " + std::to_string(gpuMs) + " ms (kernels only)";
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Apply on CPU")) {
-            const auto start = std::chrono::steady_clock::now();
-            switch (settings.filter) {
-            case 0:
-                current = vs::gaussianBlurCpu(current, settings.sigma, vs::CpuMode::Parallel);
-                break;
-            case 1:
-                current = vs::median3Cpu(current, vs::CpuMode::Parallel);
-                break;
-            default:
-                current = vs::sobelMagnitudeCpu(current, vs::CpuMode::Parallel);
-                break;
+            ImGui::Text("Last batch: %d bricks | read %.1f ms (CPU) | copy %.2f ms (GPU)", s.bricksUploaded,
+                        static_cast<double>(s.prepareMs), static_cast<double>(s.uploadMs));
+            ImGui::Text("Streamed so far: %.0f MB | index built in %.0f ms", static_cast<double>(s.bytesUploaded) / kMb,
+                        static_cast<double>(s.indexBuildMs));
+        } else {
+            ImGui::SeparatorText("Image processing");
+            constexpr const char* kFilterNames[] = {"Gaussian blur", "Median 3x3x3", "Sobel edges"};
+            ImGui::Combo("Filter", &settings.filter, kFilterNames, 3);
+            if (settings.filter == 0) {
+                ImGui::SliderFloat("Sigma", &settings.sigma, 0.5f, 5.0f);
             }
-            const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - start;
-            volumeTexture = vs::gpu::VolumeTexture(current);
-            status = "CPU " + filterName + ": " + std::to_string(elapsed.count()) + " ms (all threads)";
+            const std::string filterName = kFilterNames[settings.filter];
+            if (ImGui::Button("Apply on GPU")) {
+                float gpuMs = 0.0f;
+                switch (settings.filter) {
+                case 0:
+                    current = vs::gpu::gaussianBlurGpu(current, settings.sigma, &gpuMs);
+                    break;
+                case 1:
+                    current = vs::gpu::median3Gpu(current, &gpuMs);
+                    break;
+                default:
+                    current = vs::gpu::sobelMagnitudeGpu(current, &gpuMs);
+                    break;
+                }
+                volumeTexture = vs::gpu::VolumeTexture(current);
+                status = "GPU " + filterName + ": " + std::to_string(gpuMs) + " ms (kernels only)";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Apply on CPU")) {
+                const auto start = std::chrono::steady_clock::now();
+                switch (settings.filter) {
+                case 0:
+                    current = vs::gaussianBlurCpu(current, settings.sigma, vs::CpuMode::Parallel);
+                    break;
+                case 1:
+                    current = vs::median3Cpu(current, vs::CpuMode::Parallel);
+                    break;
+                default:
+                    current = vs::sobelMagnitudeCpu(current, vs::CpuMode::Parallel);
+                    break;
+                }
+                const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - start;
+                volumeTexture = vs::gpu::VolumeTexture(current);
+                status = "CPU " + filterName + ": " + std::to_string(elapsed.count()) + " ms (all threads)";
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset")) {
+                current = original;
+                volumeTexture = vs::gpu::VolumeTexture(current);
+                status = "Volume reset";
+            }
+            ImGui::TextWrapped("%s", status.c_str());
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Reset")) {
-            current = original;
-            volumeTexture = vs::gpu::VolumeTexture(current);
-            status = "Volume reset";
-        }
-        ImGui::TextWrapped("%s", status.c_str());
 
         ImGui::SeparatorText("Controls");
         ImGui::TextUnformatted("Left drag: orbit    Scroll: zoom");
@@ -366,8 +441,12 @@ int run(int argc, char** argv) {
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         if (!options.screenshotPath.empty() && ++frame >= options.screenshotFrame) {
-            saveScreenshot(options.screenshotPath, framebufferWidth, framebufferHeight);
-            glfwSetWindowShouldClose(window, GLFW_TRUE);
+            // When streaming, wait until the view is at full resolution (or the cache is full).
+            const bool settled = !streamer || streamer->converged() || streamer->stats().saturated;
+            if (settled || frame >= kMaxScreenshotFrames) {
+                saveScreenshot(options.screenshotPath, framebufferWidth, framebufferHeight);
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
+            }
         }
         glfwSwapBuffers(window);
     }
